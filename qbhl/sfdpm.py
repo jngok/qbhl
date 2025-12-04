@@ -1,58 +1,334 @@
-"""
-SFDPM (Structure Feature Detection & Preprocessing Module) 예시 템플릿
-- 나중에 실제 QBHL용 전처리 로직을 여기에 채워 넣으면 됨
-"""
+%%writefile /content/qbhl_repo/qbhl/sfdpm.py
+# SFDPM: Structure-preserving Feature & Data Processing Module
+# - 계층 구조 보존
+# - 재귀적 파싱
+# - HierarchicalNode 트리 구성
+# - 계층 문맥 전파(Context Propagation)
+# - 오류 허용적 파싱
+# - (옵션) 노드 풀링 및 진행 상황 표시
 
-from typing import List, Dict, Any
+from __future__ import annotations
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional, Tuple
+import json
+import uuid
+import logging
+import os
 
+# ---------- 로깅 기본 설정 ----------
+logger = logging.getLogger("SFDPM")
+if not logger.handlers:
+    handler = logging.StreamHandler()
+    formatter = logging.Formatter("[SFDPM] %(levelname)s - %(message)s")
+    handler.setFormatter(formatter)
+    logger.addHandler(handler)
+logger.setLevel(logging.INFO)
 
-def run_sfdpm(documents: List[str], query: str = "") -> Dict[str, Any]:
+# ---------- 상수 정의 ----------
+TEXT_FIELDS_PRIORITY = ["조문내용", "content", "text", "내용"]
+MIN_CONTENT_LENGTH = 20  # 20자 미만은 의미 없는 단편으로 간주
+
+# ---------- 계층 노드 클래스 설계 (HierarchicalNode) ----------
+
+@dataclass
+class HierarchicalNode:
     """
-    SFDPM 메인 함수 (예시)
+    계층 구조 보존을 위한 기본 단위 노드 클래스
+    """
+    id: str = field(default_factory=lambda: str(uuid.uuid4()))
+    content: str = ""                     # 계층 문맥이 포함된 최종 텍스트
+    data: Dict[str, Any] = field(default_factory=dict)  # 원본 JSON 조각 참조
+    level: int = 0                        # 0: 장, 1: 절, 2: 조, 3: 항, 4: 호, 5: 목 ...
+    parent: Optional["HierarchicalNode"] = None
+    children: List["HierarchicalNode"] = field(default_factory=list)
+    embedding: Optional[Any] = None       # 임베딩은 지연 평가로 나중에 계산
+
+    def add_child(self, child: "HierarchicalNode") -> None:
+        child.parent = self
+        self.children.append(child)
+
+    def path_from_root(self) -> List["HierarchicalNode"]:
+        """
+        루트부터 현재 노드까지의 경로 반환
+        """
+        path = []
+        node: Optional[HierarchicalNode] = self
+        while node is not None:
+            path.append(node)
+            node = node.parent
+        return list(reversed(path))
+
+    def text_path(self, sep: str = " > ") -> str:
+        """
+        루트부터 현재 노드까지의 content를 연결한 문자열
+        """
+        return sep.join([n.content for n in self.path_from_root() if n.content])
+
+    def __repr__(self) -> str:
+        return f"HierarchicalNode(id={self.id[:8]}, level={self.level}, content={self.content[:20]!r}...)"
+
+
+# ---------- SFDPM 파싱 결과 컨테이너 ----------
+
+@dataclass
+class SFDPMResult:
+    roots: List[HierarchicalNode]               # 루트 노드 목록
+    all_nodes: List[HierarchicalNode]           # 트리 전체 노드를 평탄화한 리스트
+    node_pool: Dict[str, HierarchicalNode]      # (옵션) 텍스트 기반 노드 캐시
+
+
+# ---------- 내부 유틸 함수들 ----------
+
+def _read_json_utf8(path: str) -> Any:
+    """
+    JSON 파일을 UTF-8로 읽고 파싱.
+    인코딩 문제 발생 시 예외를 던짐.
+    """
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            text = f.read()
+    except UnicodeDecodeError as e:
+        logger.error(f"UTF-8 인코딩 오류: {path} - {e}")
+        raise
+
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError as e:
+        logger.error(f"JSON 파싱 오류: {path} - {e}")
+        raise
+
+
+def _extract_text_from_dict(d: Dict[str, Any]) -> Optional[str]:
+    """
+    사전에서 우선순위에 따라 텍스트 필드를 추출.
+    - '조문내용' > 'content' > 'text' > '내용'
+    - 20자 미만은 None 처리
+    """
+    for key in TEXT_FIELDS_PRIORITY:
+        if key in d and isinstance(d[key], str):
+            candidate = d[key].strip()
+            if len(candidate) >= MIN_CONTENT_LENGTH:
+                return candidate
+    return None
+
+
+def _create_or_reuse_node(
+    text: str,
+    data: Dict[str, Any],
+    level: int,
+    parent: Optional[HierarchicalNode],
+    node_pool: Dict[str, HierarchicalNode],
+    context_prefix: str,
+    enable_pooling: bool = True,
+) -> HierarchicalNode:
+    """
+    노드 생성 + (옵션) 노드 풀링.
+    - context_prefix를 접두사로 붙여 계층 문맥 전파를 수행.
+    """
+    # 계층 문맥 전파: 상위 장/절/조 제목을 접두사로 붙임
+    if context_prefix:
+        full_text = f"{context_prefix} {text}".strip()
+    else:
+        full_text = text.strip()
+
+    key = full_text
+
+    if enable_pooling and key in node_pool:
+        node = node_pool[key]
+        # 부모 자식 관계만 추가로 연결 (여러 트리에서 재사용 가능)
+        if parent is not None and node not in parent.children:
+            parent.add_child(node)
+        return node
+
+    node = HierarchicalNode(
+        content=full_text,
+        data=data,
+        level=level,
+        parent=parent,
+    )
+    if parent is not None:
+        parent.add_child(node)
+
+    if enable_pooling:
+        node_pool[key] = node
+
+    return node
+
+
+def _recursive_parse(
+    obj: Any,
+    level: int,
+    parent: Optional[HierarchicalNode],
+    path: str,
+    context_prefix: str,
+    roots: List[HierarchicalNode],
+    all_nodes: List[HierarchicalNode],
+    node_pool: Dict[str, HierarchicalNode],
+    enable_pooling: bool = True,
+) -> None:
+    """
+    재귀적 하강 파싱(recursive descent parsing)
+    - dict: 텍스트 필드 찾고 노드 생성 후, 자식들에 대해 레벨+1
+    - list: 같은 level에서 형제 노드로 처리 (level 증가 X)
+    - 기타: 무시
+    """
+    try:
+        # dict 처리
+        if isinstance(obj, dict):
+            text = _extract_text_from_dict(obj)
+            node: Optional[HierarchicalNode] = None
+
+            # 이 dict에서 의미 있는 텍스트가 있으면 새로운 노드 생성
+            if text:
+                node = _create_or_reuse_node(
+                    text=text,
+                    data=obj,
+                    level=level,
+                    parent=parent,
+                    node_pool=node_pool,
+                    context_prefix=context_prefix,
+                    enable_pooling=enable_pooling,
+                )
+                all_nodes.append(node)
+
+                # 최상위 루트 조건: parent가 없는 첫 노드
+                if parent is None and node not in roots:
+                    roots.append(node)
+
+                # 자식들에게 전달할 새로운 문맥: 현재 노드의 content 전체
+                new_context_prefix = node.content
+            else:
+                # 텍스트가 없는 dict이면 문맥은 그대로 유지
+                new_context_prefix = context_prefix
+
+            # 하위 요소 재귀 처리
+            for k, v in obj.items():
+                child_path = f"{path}.{k}" if path else k
+                # 텍스트 노드를 생성한 경우에만 level+1, 아니면 같은 level 유지
+                next_level = level + 1 if text else level
+                _recursive_parse(
+                    obj=v,
+                    level=next_level,
+                    parent=node or parent,
+                    path=child_path,
+                    context_prefix=new_context_prefix,
+                    roots=roots,
+                    all_nodes=all_nodes,
+                    node_pool=node_pool,
+                    enable_pooling=enable_pooling,
+                )
+
+        # list 처리: 같은 level에서 형제 노드
+        elif isinstance(obj, list):
+            for idx, item in enumerate(obj):
+                child_path = f"{path}[{idx}]"
+                _recursive_parse(
+                    obj=item,
+                    level=level,  # list 항목은 같은 계층
+                    parent=parent,
+                    path=child_path,
+                    context_prefix=context_prefix,
+                    roots=roots,
+                    all_nodes=all_nodes,
+                    node_pool=node_pool,
+                    enable_pooling=enable_pooling,
+                )
+
+        # 기타 타입은 무시 (str, int 등은 위에서 텍스트 필드로 처리됨)
+        else:
+            return
+
+    except Exception as e:
+        # 오류 허용적 전략: 에러 로그만 남기고 계속 진행
+        logger.warning(f"파싱 중 오류 발생: path={path}, error={e}")
+
+
+# ---------- 외부에서 사용하는 주요 API ----------
+
+def parse_json_to_tree(
+    json_data: Any,
+    enable_pooling: bool = True,
+) -> SFDPMResult:
+    """
+    이미 파싱된 JSON 객체를 입력으로 받아
+    계층 트리(HierarchicalNode)로 변환.
 
     Parameters
     ----------
-    documents : List[str]
-        레이블링/전처리 대상 문장 리스트
-    query : str
-        질의(예: '예방 단계', '대응 단계' 등). 아직은 로그 용도로만 사용.
+    json_data : Any
+        json.loads(...) 결과 객체
+    enable_pooling : bool
+        동일 텍스트 노드 풀링 여부
 
     Returns
     -------
-    Dict[str, Any]
-        간단한 요약 정보(문장 수, 첫 문장, 질의 내용 등)를 담은 딕셔너리
+    SFDPMResult
+        루트 노드, 전체 노드, 노드 풀을 포함하는 결과
     """
-    n_docs = len(documents)
+    roots: List[HierarchicalNode] = []
+    all_nodes: List[HierarchicalNode] = []
+    node_pool: Dict[str, HierarchicalNode] = {}
 
-    return {
-        "status": "ok",
-        "n_docs": n_docs,
-        "query": query,
-        "first_doc": documents[0] if n_docs > 0 else None,
-    }
+    _recursive_parse(
+        obj=json_data,
+        level=0,
+        parent=None,
+        path="",
+        context_prefix="",
+        roots=roots,
+        all_nodes=all_nodes,
+        node_pool=node_pool,
+        enable_pooling=enable_pooling,
+    )
+
+    logger.info(f"파싱 완료: 루트 노드 {len(roots)}개, 전체 노드 {len(all_nodes)}개")
+    return SFDPMResult(roots=roots, all_nodes=all_nodes, node_pool=node_pool)
 
 
-def simple_summary(documents: List[str]) -> Dict[str, Any]:
+def parse_json_file_to_tree(
+    path: str,
+    enable_pooling: bool = True,
+) -> SFDPMResult:
     """
-    문장 리스트에 대한 아주 간단한 통계 요약 함수 (예시)
+    단일 JSON 파일을 읽어서 SFDPM 계층 트리로 변환.
 
-    Parameters
-    ----------
-    documents : List[str]
-        대상 문장 리스트
+    1) UTF-8 인코딩 검증 및 JSON 파싱
+    2) 재귀적 구조 파싱
+    3) HierarchicalNode 트리 구성
+    """
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"파일을 찾을 수 없습니다: {path}")
+
+    logger.info(f"JSON 파일 파싱 시작: {path}")
+    data = _read_json_utf8(path)
+    return parse_json_to_tree(data, enable_pooling=enable_pooling)
+
+
+def parse_multiple_files(
+    paths: List[str],
+    enable_pooling: bool = True,
+    progress_interval: int = 100,
+) -> List[SFDPMResult]:
+    """
+    여러 개의 JSON 파일을 순차적으로 처리.
+    100개 단위로 진행 상황을 로그에 출력.
 
     Returns
     -------
-    Dict[str, Any]
-        문장 수, 전체 길이, 평균 길이 등을 담은 요약 정보
+    List[SFDPMResult]
+        각 파일에 대한 파싱 결과 리스트
     """
-    lengths = [len(d) for d in documents]
-    n_docs = len(lengths)
-    total_len = sum(lengths) if n_docs > 0 else 0
-    avg_len = total_len / n_docs if n_docs > 0 else 0
+    results: List[SFDPMResult] = []
+    for idx, p in enumerate(paths, start=1):
+        try:
+            result = parse_json_file_to_tree(p, enable_pooling=enable_pooling)
+            results.append(result)
+        except Exception as e:
+            logger.warning(f"파일 처리 중 오류 발생: {p} - {e}")
+            continue
 
-    return {
-        "n_docs": n_docs,
-        "total_len": total_len,
-        "avg_len": avg_len,
-    }
+        if idx % progress_interval == 0:
+            logger.info(f"{idx}개 파일 처리 완료")
+
+    logger.info(f"총 {len(results)}개 파일 파싱 완료")
+    return results
