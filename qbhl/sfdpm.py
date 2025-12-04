@@ -1,12 +1,3 @@
-%%writefile /content/qbhl_repo/qbhl/sfdpm.py
-# SFDPM: Structure-preserving Feature & Data Processing Module
-# - 계층 구조 보존
-# - 재귀적 파싱
-# - HierarchicalNode 트리 구성
-# - 계층 문맥 전파(Context Propagation)
-# - 오류 허용적 파싱
-# - (옵션) 노드 풀링 및 진행 상황 표시
-
 from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
@@ -332,3 +323,4 @@ def parse_multiple_files(
 
     logger.info(f"총 {len(results)}개 파일 파싱 완료")
     return results
+
